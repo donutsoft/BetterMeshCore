@@ -35,6 +35,10 @@
 #include <helpers/RegionMap.h>
 #include "RateLimiter.h"
 
+#if ENABLE_RAW_LORA_BLE == 1
+#include <helpers/nrf52/RawLoRaBLEInterface.h>
+#endif
+
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
 #endif
@@ -117,6 +121,21 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
   ESPNowBridge bridge;
+#endif
+#if ENABLE_RAW_LORA_BLE == 1
+  struct RawTxFrame {
+    uint16_t len;
+    uint8_t buf[MAX_TRANS_UNIT];
+  };
+
+  RawLoRaBLEInterface raw_ble;
+  uint8_t raw_tx_queue_len;
+  RawTxFrame raw_tx_queue[RAW_LORA_BLE_QUEUE_SIZE];
+  bool raw_tx_active;
+  unsigned long raw_tx_expiry;
+
+  void shiftRawTxQueueLeft();
+  bool processRawLoRaBLE();
 #endif
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);

@@ -460,6 +460,11 @@ const char *MyMesh::getLogDateTime() {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+#if ENABLE_RAW_LORA_BLE == 1
+  (void)snr;
+  (void)rssi;
+  raw_ble.notifyRawPacket(raw, len);
+#endif
 #if MESH_PACKET_LOGGING
   Serial.print(getLogDateTime());
   Serial.print(" RAW: ");
@@ -863,6 +868,11 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+#if ENABLE_RAW_LORA_BLE == 1
+  raw_tx_queue_len = 0;
+  raw_tx_active = false;
+  raw_tx_expiry = 0;
+#endif
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -887,6 +897,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_advert_interval = 12; // 12 hours
   _prefs.flood_max = 64;
   _prefs.interference_threshold = 0; // disabled
+  _prefs.raw_ble_advertising_enabled = 0;
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
@@ -926,6 +937,11 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
+
+#if ENABLE_RAW_LORA_BLE == 1
+  raw_ble.begin("MeshCore ", _prefs.node_name, BLE_PIN_CODE);
+  raw_ble.setAdvertisingEnabled(_prefs.raw_ble_advertising_enabled);
+#endif
 
   // establish default-scope
   {
@@ -1251,12 +1267,88 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+#if ENABLE_RAW_LORA_BLE == 1
+  } else if (strcmp(command, "ble on") == 0 || strcmp(command, "ble advert on") == 0) {
+    _prefs.raw_ble_advertising_enabled = 1;
+    _cli.savePrefs(_fs);
+    raw_ble.setAdvertisingEnabled(true);
+    strcpy(reply, "OK - BLE advertising ON");
+  } else if (strcmp(command, "ble off") == 0 || strcmp(command, "ble advert off") == 0) {
+    _prefs.raw_ble_advertising_enabled = 0;
+    _cli.savePrefs(_fs);
+    raw_ble.setAdvertisingEnabled(false);
+    strcpy(reply, "OK - BLE advertising OFF");
+  } else if (strcmp(command, "ble") == 0 || strcmp(command, "ble status") == 0) {
+    sprintf(reply, "> advertising %s, %s",
+            raw_ble.isEnabled() ? "on" : "off",
+            raw_ble.isConnected() ? "connected" : "disconnected");
+#endif
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }
 
+#if ENABLE_RAW_LORA_BLE == 1
+void MyMesh::shiftRawTxQueueLeft() {
+  if (raw_tx_queue_len == 0) return;
+
+  raw_tx_queue_len--;
+  for (uint8_t i = 0; i < raw_tx_queue_len; i++) {
+    raw_tx_queue[i] = raw_tx_queue[i + 1];
+  }
+}
+
+bool MyMesh::processRawLoRaBLE() {
+  raw_ble.loop();
+
+  while (raw_tx_queue_len < RAW_LORA_BLE_QUEUE_SIZE) {
+    uint8_t raw[MAX_TRANS_UNIT];
+    size_t len = raw_ble.checkRecvRawPacket(raw, sizeof(raw));
+    if (len == 0) break;
+
+    RawTxFrame& frame = raw_tx_queue[raw_tx_queue_len++];
+    frame.len = len;
+    memcpy(frame.buf, raw, len);
+  }
+
+  if (raw_tx_active) {
+    _radio->loop();
+    if (_radio->isSendComplete()) {
+      _radio->onSendFinished();
+      raw_tx_active = false;
+    } else if (millisHasNowPassed(raw_tx_expiry)) {
+      MESH_DEBUG_PRINTLN("%s Raw LoRa BLE TX timed out", getLogDateTime());
+      _radio->onSendFinished();
+      raw_tx_active = false;
+    } else {
+      return true;
+    }
+  }
+
+  if (raw_tx_queue_len == 0) return false;
+  if (_mgr->getOutboundTotal() > 0 || !_radio->isInRecvMode() || _radio->isReceiving()) return false;
+
+  RawTxFrame& frame = raw_tx_queue[0];
+  uint32_t max_airtime = _radio->getEstAirtimeFor(frame.len) * 3 / 2;
+  if (max_airtime < 100) max_airtime = 100;
+
+  if (_radio->startSendRaw(frame.buf, frame.len)) {
+    raw_tx_expiry = futureMillis(max_airtime);
+    raw_tx_active = true;
+    shiftRawTxQueueLeft();
+    return true;
+  }
+
+  shiftRawTxQueueLeft();
+  return false;
+}
+#endif
+
 void MyMesh::loop() {
+#if ENABLE_RAW_LORA_BLE == 1
+  if (processRawLoRaBLE()) return;
+#endif
+
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif
@@ -1305,6 +1397,9 @@ void MyMesh::loop() {
 bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#if ENABLE_RAW_LORA_BLE == 1
+  if (raw_ble.isConnected() || raw_tx_active || raw_tx_queue_len > 0) return true;
 #endif
   return _mgr->getOutboundTotal() > 0;
 }
